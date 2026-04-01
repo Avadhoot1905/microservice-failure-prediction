@@ -147,7 +147,7 @@ get_downstream_dependencies("Web") returns ["API"]
 
 ### 2.4 Graph-Based ML Predictor (`backend/simulation/graph_learning_model.py`)
 
-**Responsibility:** The core intelligence engine. Predicts per-node failure probabilities `P(failure) ∈ [0, 1]` using a graph-aware MLP model that learns from historical outcomes.
+**Responsibility:** The core intelligence engine. Predicts per-node failure probabilities `P(failure) ∈ [0, 1]` using a graph-aware MLP model that learns from historical outcomes. Incorporates **dynamic attention scoring** to modulate edge weights based on real-time telemetry correlation between connected services.
 
 This is the **Graph Learning Agent** — the centerpiece implementation of the patent.
 
@@ -162,6 +162,10 @@ This is the **Graph Learning Agent** — the centerpiece implementation of the p
 | **Cold Start** | `< 10` training samples accumulated | Sigmoid-based heuristic scoring function |
 | **Learned** | `≥ 10` samples, model trained | Calibrated MLP neural network |
 
+**Key Capabilities:**
+- **Dynamic Attention:** Edge weights are dynamically modulated via Pearson correlation of CPU telemetry over a rolling 10-tick window, amplifying edges between services that exhibit synchronized stress patterns
+- **Metric History:** Maintains a per-node rolling window of CPU and latency metrics (`_metric_history`) for temporal correlation analysis
+
 **Public API:**
 
 | Method | Input | Output |
@@ -169,7 +173,7 @@ This is the **Graph Learning Agent** — the centerpiece implementation of the p
 | `predict_failure_probabilities(graph_engine)` | Current graph state | Dict with per-node probabilities, system risk, severity, cascade info |
 | `train_on_batch(predicted, actual, graph_engine)` | Predictions + ground-truth labels | Sample count + readiness status |
 | `update_model()` | *(uses internal buffer)* | Training status, iteration count, accuracy score |
-| `save_model(path)` / `load_model(path)` | File path | Persists/restores full model state via `joblib` |
+| `save_model(path)` / `load_model(path)` | File path | Persists/restores full model state (including metric history) via `joblib` |
 
 **Detailed operation is covered in [Section 5: Machine Learning Design](#5-machine-learning-design).**
 
@@ -379,14 +383,15 @@ GraphFailurePredictor.predict_failure_probabilities(graph_engine)
   ├── 1. Build adjacency list + edge weight map
   ├── 2. Extract 6-dim raw features per node:
   │        [cpu, log_latency, error_rate, criticality, degree, dep_count]
-  ├── 3. Compute 12-dim graph-aware embeddings:
-  │        concat(node_features, weighted_mean(neighbor_features))
+  ├── 3. Compute 12-dim graph-aware embeddings with DYNAMIC ATTENTION:
+  │        concat(node_features, dynamic_weighted_mean(neighbor_features))
+  │        Edge weights modulated by Pearson correlation of 10-tick CPU history
   ├── 4. Append 2-dim temporal signals:
   │        [previous_cpu, delta_cpu]
   ├── 5. Predict (14-dim input vector):
   │        IF trained → MLP.predict_proba() (learned mode)
   │        ELSE       → sigmoid heuristic   (cold_start mode)
-  ├── 6. Update temporal state for next tick
+  ├── 6. Update temporal state + metric history (10-tick rolling window)
   └── 7. Build output: system_risk, severity, cascade analysis
 ```
 
@@ -475,20 +480,47 @@ Calibrated P(failure) ∈ [0, 1]
 | 12 | `previous_cpu` | Prior tick CPU cache | Temporal |
 | 13 | `delta_cpu` | `current_cpu - previous_cpu` | Temporal |
 
-### Graph-Aware Embedding Computation
+### Graph-Aware Embedding Computation with Dynamic Attention
 
-For each node, the embedding is the concatenation of its own features and a weighted aggregation of its neighbors' features:
+For each node, the embedding is the concatenation of its own features and a **dynamically weighted** aggregation of its neighbors' features:
 
 ```
-embedding(v) = concat( features(v), Σ(w_e · features(u)) / Σ(w_e) )
+embedding(v) = concat( features(v), Σ(w̃_e · features(u)) / Σ(w̃_e) )
                                      u ∈ N(v)                u ∈ N(v)
 
 where:
   N(v)  = bidirectional neighborhood (upstream dependents + downstream deps)
-  w_e   = amplification_factor on the connecting edge
+  w̃_e  = dynamic_attention(v, u, amplification_factor)
 ```
 
-This replaces explicit BFS propagation with a learned structural context — the model learns *how* failures propagate through the graph structure rather than following hand-coded decay rules.
+#### Dynamic Attention Scoring (`_calculate_dynamic_attention`)
+
+Edge weights are no longer static `amplification_factor` values. Instead, they are **dynamically modulated** based on real-time telemetry correlation between connected services:
+
+```python
+# 1. Retrieve 10-tick rolling CPU history for both nodes
+cpu_a = metric_history[node_a]["cpu"]  # last 10 ticks
+cpu_b = metric_history[node_b]["cpu"]  # last 10 ticks
+
+# 2. Compute Pearson correlation coefficient
+r = np.corrcoef(cpu_a, cpu_b)[0, 1]
+
+# 3. Dynamic multiplier: amplify edges between correlated services
+dynamic_weight = base_weight * (1.0 + max(0.0, correlation))
+```
+
+**Behavior:**
+
+| Correlation (r) | Multiplier | Interpretation |
+|-----------------|------------|----------------|
+| `r ≈ 1.0` (high positive) | `base × 2.0` | Services degrade in sync → doubled attention (likely causal link) |
+| `r ≈ 0.0` (uncorrelated) | `base × 1.0` | No telemetry correlation → static amplification factor |
+| `r < 0.0` (negative) | `base × 1.0` | Anti-correlated → clamped to base (no reduction) |
+| `< 5 ticks history` | `base × 1.0` | Insufficient data → fallback to static weight |
+
+**Why This Matters:** In real microservice deployments, a database under CPU stress often causes correlated CPU spikes in its API consumers due to blocked threads and connection pool exhaustion. Dynamic attention automatically discovers these runtime coupling patterns and amplifies the corresponding edges, making cascade predictions more accurate than static amplification factors alone.
+
+This replaces explicit BFS propagation with a learned structural context enhanced by runtime telemetry correlation — the model learns *how* failures propagate through the graph structure rather than following hand-coded decay rules.
 
 ### Output Dictionary
 
@@ -545,8 +577,9 @@ P(failure) = 1 / (1 + exp(-5 * (raw_score - 0.5)))
 The system models failure propagation through the dependency graph structure:
 
 1. **Dependency Direction:** An edge `A → B` means A depends on B. If B fails, A *receives* risk.
-2. **Amplification Factors:** Each edge carries an `amplification_factor` (range: `0.5–2.5` in benchmarks). Higher values mean a failure at the dependency has a *stronger* impact on the dependent service.
-3. **Bidirectional Neighborhood:** For embedding computation, both upstream (dependents) and downstream (dependencies) neighbors are aggregated. This gives each node contextual awareness of stress in *both* directions.
+2. **Amplification Factors:** Each edge carries a static `amplification_factor` (range: `0.5–2.5` in benchmarks), which is then **dynamically modulated** at runtime via Pearson-correlation-based attention scoring.
+3. **Dynamic Attention:** When two connected services exhibit correlated CPU degradation over a 10-tick window, the edge weight between them is amplified up to 2× the base value. This allows the system to automatically discover and strengthen causal propagation paths based on live telemetry.
+4. **Bidirectional Neighborhood:** For embedding computation, both upstream (dependents) and downstream (dependencies) neighbors are aggregated. This gives each node contextual awareness of stress in *both* directions.
 
 ### Risk Scoring Mechanism
 
@@ -570,8 +603,10 @@ propagation_risk = Σ(contribution_v) / total_nodes
 | Aspect | Legacy (`propagation.py`) | Current (`graph_learning_model.py`) |
 |--------|--------------------------|--------------------------------------|
 | Method | BFS traversal with hop decay | Learned embeddings + MLP |
-| Risk decay | `risk × amp × decay_factor` per hop (max 5 hops) | Implicitly learned via neighbor aggregation |
-| Adaptability | Static parameters | Model weights updated via training |
+| Edge Weights | Static `amplification_factor` only | Dynamic attention (Pearson correlation × static factor) |
+| Risk decay | `risk × amp × decay_factor` per hop (max 5 hops) | Implicitly learned via dynamic neighbor aggregation |
+| Adaptability | Static parameters | Model weights + dynamic edge weights adapt over time |
+| Temporal Awareness | None | 10-tick rolling CPU/latency history per node |
 | Status | Deprecated (retained for testing) | Active |
 
 ---
@@ -648,7 +683,7 @@ The `BenchmarkRunner` executes structured experiments across three tracks to pro
 | **Average Cascade Size** | Mean of actual cascaded node count | Measures damage scope |
 | **Average Precision** | Mean of `TP / (TP + FP)` per scenario | Are predictions reliable? |
 | **Average Recall** | Mean of `TP / (TP + FN)` per scenario | Are all failures caught? |
-| **Risk Reduction %** | `(baseline_risk - mitigated_risk) / baseline_risk × 100` | Action engine effectiveness |
+| **Cascade Reduction %** | Cross-track: `(baseline_cascade - mitigated_cascade) / baseline_cascade × 100` | Action engine effectiveness (computed across tracks, not per-scenario) |
 | **Stabilization Cycles** | Ticks until severity returns to `LOW` | Mean Time To Recovery (MTTR proxy) |
 | **Severity Distribution** | Count of `CRITICAL / HIGH / MODERATE / LOW` outcomes | Overall system resilience profile |
 | **Convergence Trend** | Per-cycle precision averaged across trials | Does the model improve over time? |
@@ -808,7 +843,7 @@ microservice-failure-prediction/
 - Graph-aware embeddings allow the model to learn propagation patterns implicitly rather than relying on hand-coded BFS traversal rules
 - Edge amplification factors capture heterogeneous dependency strengths
 
-**Tradeoff:** The current weighted-mean neighbor aggregation is a single-hop operation. It captures immediate neighbors but not multi-hop propagation paths. A full Graph Neural Network would capture deeper structural patterns but at higher computational cost.
+**Tradeoff:** The current weighted-mean neighbor aggregation is a single-hop operation. However, the **dynamic attention scoring** mechanism partially compensates by amplifying edges where runtime telemetry indicates synchronized degradation — effectively surfacing multi-hop causal chains through correlation rather than explicit graph traversal. A full Graph Neural Network would capture deeper structural patterns natively but at higher computational cost.
 
 ### Why Proactive Prediction?
 
@@ -856,7 +891,7 @@ microservice-failure-prediction/
 ### Short-Term Enhancements
 
 - **Graph Neural Networks:** Replace MLP + hand-crafted embeddings with GCN/GAT/GraphSAGE for multi-hop structural learning
-- **Temporal Graph Networks:** Incorporate temporal attention to model evolving failure patterns over time windows, not just single delta_cpu
+- **Multi-Variate Dynamic Attention:** Extend the current CPU-based Pearson correlation to incorporate latency and error rate correlation (the `_metric_history` already stores normalized latency for this purpose)
 - **Richer Feature Space:** Add memory utilization, disk I/O, network throughput, request queue depth, and container restart counts
 - **Ensemble Models:** Combine probabilistic (MLP), graph-structural (GNN), and time-series (LSTM) predictions
 
